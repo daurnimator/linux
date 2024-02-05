@@ -284,6 +284,7 @@ int bch2_dirent_rename(struct btree_trans *trans,
 		subvol_inum src_dir, struct bch_hash_info *src_hash,
 		subvol_inum dst_dir, struct bch_hash_info *dst_hash,
 		const struct qstr *src_name, subvol_inum *src_inum, u64 *src_offset,
+		u64 whiteout_inum, u64 *whiteout_offset,
 		const struct qstr *dst_name, subvol_inum *dst_inum, u64 *dst_offset,
 		enum bch_rename_mode mode)
 {
@@ -318,7 +319,9 @@ int bch2_dirent_rename(struct btree_trans *trans,
 		goto out;
 
 	/* Lookup dst: */
-	if (mode == BCH_RENAME) {
+	switch (mode) {
+	case BCH_RENAME:
+	case BCH_RENAME_WHITEOUT:
 		/*
 		 * Note that we're _not_ checking if the target already exists -
 		 * we're relying on the VFS to do that check for us for
@@ -328,7 +331,10 @@ int bch2_dirent_rename(struct btree_trans *trans,
 				     dst_hash, dst_dir, dst_name);
 		if (ret)
 			goto out;
-	} else {
+		break;
+	case BCH_RENAME_OVERWRITE:
+	case BCH_RENAME_OVERWRITE_WHITEOUT:
+	case BCH_RENAME_EXCHANGE:
 		ret = bch2_hash_lookup(trans, &dst_iter, bch2_dirent_hash_desc,
 				       dst_hash, dst_dir, dst_name,
 				       BTREE_ITER_INTENT);
@@ -344,6 +350,9 @@ int bch2_dirent_rename(struct btree_trans *trans,
 				bkey_s_c_to_dirent(old_dst), dst_inum);
 		if (ret)
 			goto out;
+		break;
+	default:
+		BUG();
 	}
 
 	if (mode != BCH_RENAME_EXCHANGE)
@@ -359,7 +368,8 @@ int bch2_dirent_rename(struct btree_trans *trans,
 	new_dst->k.p = dst_iter.pos;
 
 	/* Create new src key: */
-	if (mode == BCH_RENAME_EXCHANGE) {
+	switch (mode) {
+	case BCH_RENAME_EXCHANGE:
 		new_src = dirent_create_key(trans, src_dir, 0, src_name, 0);
 		ret = PTR_ERR_OR_ZERO(new_src);
 		if (ret)
@@ -367,7 +377,24 @@ int bch2_dirent_rename(struct btree_trans *trans,
 
 		dirent_copy_target(new_src, bkey_s_c_to_dirent(old_dst));
 		new_src->k.p = src_iter.pos;
-	} else {
+		break;
+	case BCH_RENAME_WHITEOUT:
+	case BCH_RENAME_OVERWRITE_WHITEOUT:
+		new_src = dirent_create_key(trans, src_dir, DT_CHR, src_name, whiteout_inum);
+		ret = PTR_ERR_OR_ZERO(new_src);
+		if (ret)
+			goto out;
+
+		ret = bch2_hash_set(trans, bch2_dirent_hash_desc, src_hash,
+				    src_dir, &new_src->k_i, __BCH_HASH_SET_MUST_CREATE);
+		if (ret)
+			goto out;
+
+		*whiteout_offset = src_iter.pos.offset;
+
+		break;
+	case BCH_RENAME:
+	case BCH_RENAME_OVERWRITE:
 		new_src = bch2_trans_kmalloc(trans, sizeof(struct bkey_i));
 		ret = PTR_ERR_OR_ZERO(new_src);
 		if (ret)
@@ -411,6 +438,9 @@ int bch2_dirent_rename(struct btree_trans *trans,
 			if (ret)
 				new_src->k.type = KEY_TYPE_hash_whiteout;
 		}
+		break;
+	default:
+		BUG();
 	}
 
 	if (new_dst->v.d_type == DT_SUBVOL)

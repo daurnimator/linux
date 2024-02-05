@@ -51,7 +51,9 @@ static inline unsigned vfs_d_type(unsigned type)
 
 enum bch_rename_mode {
 	BCH_RENAME,
+	BCH_RENAME_WHITEOUT,
 	BCH_RENAME_OVERWRITE,
+	BCH_RENAME_OVERWRITE_WHITEOUT,
 	BCH_RENAME_EXCHANGE,
 };
 
@@ -59,6 +61,7 @@ int bch2_dirent_rename(struct btree_trans *,
 		       subvol_inum, struct bch_hash_info *,
 		       subvol_inum, struct bch_hash_info *,
 		       const struct qstr *, subvol_inum *, u64 *,
+		       u64, u64 *,
 		       const struct qstr *, subvol_inum *, u64 *,
 		       enum bch_rename_mode);
 

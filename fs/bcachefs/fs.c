@@ -609,24 +609,42 @@ static int bch2_rename2(struct mnt_idmap *idmap,
 	struct bch_inode_info *src_dir = to_bch_ei(src_vdir);
 	struct bch_inode_info *dst_dir = to_bch_ei(dst_vdir);
 	struct bch_inode_info *src_inode = to_bch_ei(src_dentry->d_inode);
+	struct bch_inode_info *whiteout_inode;
 	struct bch_inode_info *dst_inode = to_bch_ei(dst_dentry->d_inode);
 	struct bch_inode_unpacked dst_dir_u, src_dir_u;
 	struct bch_inode_unpacked src_inode_u, dst_inode_u;
+	struct bch2_whiteout_state whiteout;
 	struct btree_trans *trans;
 	enum bch_rename_mode mode = flags & RENAME_EXCHANGE
 		? BCH_RENAME_EXCHANGE
 		: dst_dentry->d_inode
-		? BCH_RENAME_OVERWRITE : BCH_RENAME;
+		? (flags & RENAME_WHITEOUT ? BCH_RENAME_OVERWRITE_WHITEOUT : BCH_RENAME_OVERWRITE)
+		: (flags & RENAME_WHITEOUT ? BCH_RENAME_WHITEOUT : BCH_RENAME);
 	int ret;
 
-	if (flags & ~(RENAME_NOREPLACE|RENAME_EXCHANGE))
+	if (flags & ~(RENAME_NOREPLACE|RENAME_EXCHANGE|RENAME_WHITEOUT))
 		return -EINVAL;
 
-	if (mode == BCH_RENAME_OVERWRITE) {
+	if (mode == BCH_RENAME_OVERWRITE || mode == BCH_RENAME_OVERWRITE_WHITEOUT) {
 		ret = filemap_write_and_wait_range(src_inode->v.i_mapping,
 						   0, LLONG_MAX);
 		if (ret)
 			return ret;
+	}
+
+	if (mode == BCH_RENAME_WHITEOUT || mode == BCH_RENAME_OVERWRITE_WHITEOUT) {
+		/*
+		 * preallocate vfs inode before btree transaction, so that
+		 * nothing can fail after the transaction succeeds:
+		 */
+		whiteout_inode = to_bch_ei(new_inode(c->vfs_sb));
+		if (unlikely(!whiteout_inode))
+			return -ENOMEM;
+
+		bch2_inode_init_early(c, &whiteout.inode_u);
+		whiteout.uid = from_kuid(i_user_ns(&src_dir->v), current_fsuid());
+		whiteout.gid = from_kgid(i_user_ns(&src_dir->v), current_fsgid());
+		bch2_quota_acct(c, bch_qid(&whiteout.inode_u), Q_INO, 1, KEY_TYPE_QUOTA_PREALLOC);
 	}
 
 	trans = bch2_trans_get(c);
@@ -666,6 +684,7 @@ static int bch2_rename2(struct mnt_idmap *idmap,
 					  inode_inum(src_dir), &src_dir_u,
 					  inode_inum(dst_dir), &dst_dir_u,
 					  &src_inode_u,
+					  &whiteout,
 					  &dst_inode_u,
 					  &src_dentry->d_name,
 					  &dst_dentry->d_name,
@@ -690,6 +709,21 @@ static int bch2_rename2(struct mnt_idmap *idmap,
 	if (dst_inode)
 		bch2_inode_update_after_write(trans, dst_inode, &dst_inode_u,
 					      ATTR_CTIME);
+
+	if (mode == BCH_RENAME_WHITEOUT || mode == BCH_RENAME_OVERWRITE_WHITEOUT) {
+		struct bch_subvolume src_subvol;
+
+		ret = bch2_subvolume_get(trans, src_dir->ei_subvol, true, 0, &src_subvol);
+		if (ret)
+			goto err;
+
+		subvol_inum inum;
+		inum.subvol = whiteout.inode_u.bi_subvol ?: src_dir->ei_subvol;
+		inum.inum = whiteout.inode_u.bi_inum;
+
+		bch2_vfs_inode_init(trans, inum, whiteout_inode, &whiteout.inode_u, &src_subvol);
+		whiteout_inode = bch2_inode_insert(c, whiteout_inode);
+	}
 err:
 	bch2_trans_put(trans);
 
@@ -708,6 +742,10 @@ err:
 			   dst_dir,
 			   src_inode,
 			   dst_inode);
+
+	if (ret && (mode == BCH_RENAME_WHITEOUT || mode == BCH_RENAME_OVERWRITE_WHITEOUT)) {
+		bch2_quota_acct(c, bch_qid(&whiteout.inode_u), Q_INO, -1, KEY_TYPE_QUOTA_NOCHECK);
+	}
 
 	return ret;
 }

@@ -4,6 +4,12 @@
 
 struct posix_acl;
 
+struct bch2_whiteout_state {
+	struct bch_inode_unpacked inode_u;
+	uid_t uid;
+	gid_t gid;
+};
+
 #define BCH_CREATE_TMPFILE		(1U << 0)
 #define BCH_CREATE_SUBVOL		(1U << 1)
 #define BCH_CREATE_SNAPSHOT		(1U << 2)
@@ -32,6 +38,7 @@ int bch2_rename_trans(struct btree_trans *,
 		      subvol_inum, struct bch_inode_unpacked *,
 		      subvol_inum, struct bch_inode_unpacked *,
 		      struct bch_inode_unpacked *,
+		      struct bch2_whiteout_state *,
 		      struct bch_inode_unpacked *,
 		      const struct qstr *,
 		      const struct qstr *,

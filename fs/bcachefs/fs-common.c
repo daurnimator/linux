@@ -353,6 +353,7 @@ int bch2_rename_trans(struct btree_trans *trans,
 		      subvol_inum src_dir, struct bch_inode_unpacked *src_dir_u,
 		      subvol_inum dst_dir, struct bch_inode_unpacked *dst_dir_u,
 		      struct bch_inode_unpacked *src_inode_u,
+		      struct bch2_whiteout_state *whiteout,
 		      struct bch_inode_unpacked *dst_inode_u,
 		      const struct qstr *src_name,
 		      const struct qstr *dst_name,
@@ -362,10 +363,11 @@ int bch2_rename_trans(struct btree_trans *trans,
 	struct btree_iter src_dir_iter = { NULL };
 	struct btree_iter dst_dir_iter = { NULL };
 	struct btree_iter src_inode_iter = { NULL };
+	struct btree_iter whiteout_inode_iter = { NULL };
 	struct btree_iter dst_inode_iter = { NULL };
 	struct bch_hash_info src_hash, dst_hash;
 	subvol_inum src_inum, dst_inum;
-	u64 src_offset, dst_offset;
+	u64 src_offset, dst_offset, whiteout_offset;
 	u64 now = bch2_current_time(c);
 	int ret;
 
@@ -389,10 +391,28 @@ int bch2_rename_trans(struct btree_trans *trans,
 		dst_hash = src_hash;
 	}
 
+
+	if (mode == BCH_RENAME_WHITEOUT || mode == BCH_RENAME_OVERWRITE_WHITEOUT) {
+		u32 snapshot;
+
+		ret = bch2_subvolume_get_snapshot(trans, src_dir.subvol, &snapshot);
+		if (ret)
+			goto err;
+
+		bch2_inode_init_late(&whiteout->inode_u, now, whiteout->uid, whiteout->gid, S_IFCHR | WHITEOUT_MODE, 0, src_dir_u);
+
+		ret = bch2_inode_create(trans, &whiteout_inode_iter, &whiteout->inode_u, snapshot, raw_smp_processor_id());
+		if (ret)
+			goto err;
+		whiteout_inode_iter.flags &= ~BTREE_ITER_ALL_SNAPSHOTS;
+		bch2_btree_iter_set_snapshot(&whiteout_inode_iter, snapshot);
+	}
+
 	ret = bch2_dirent_rename(trans,
 				 src_dir, &src_hash,
 				 dst_dir, &dst_hash,
 				 src_name, &src_inum, &src_offset,
+				 whiteout->inode_u.bi_inum, &whiteout_offset,
 				 dst_name, &dst_inum, &dst_offset,
 				 mode);
 	if (ret)
@@ -421,6 +441,12 @@ int bch2_rename_trans(struct btree_trans *trans,
 	if (src_inode_u->bi_parent_subvol)
 		src_inode_u->bi_parent_subvol = dst_dir.subvol;
 
+	if (mode == BCH_RENAME_WHITEOUT || mode == BCH_RENAME_OVERWRITE_WHITEOUT) {
+		whiteout->inode_u.bi_parent_subvol	= src_dir.subvol;
+		whiteout->inode_u.bi_dir		= src_dir_u->bi_inum;
+		whiteout->inode_u.bi_dir_offset		= whiteout_offset;
+	}
+
 	if ((mode == BCH_RENAME_EXCHANGE) &&
 	    dst_inode_u->bi_parent_subvol)
 		dst_inode_u->bi_parent_subvol = src_dir.subvol;
@@ -433,14 +459,13 @@ int bch2_rename_trans(struct btree_trans *trans,
 		dst_inode_u->bi_dir_offset	= src_offset;
 	}
 
-	if (mode == BCH_RENAME_OVERWRITE &&
-	    dst_inode_u->bi_dir		== dst_dir_u->bi_inum &&
-	    dst_inode_u->bi_dir_offset	== src_offset) {
-		dst_inode_u->bi_dir		= 0;
-		dst_inode_u->bi_dir_offset	= 0;
-	}
+	if (mode == BCH_RENAME_OVERWRITE || mode == BCH_RENAME_OVERWRITE_WHITEOUT) {
+		if (dst_inode_u->bi_dir	       == dst_dir_u->bi_inum &&
+		    dst_inode_u->bi_dir_offset == src_offset) {
+			dst_inode_u->bi_dir		= 0;
+			dst_inode_u->bi_dir_offset	= 0;
+		}
 
-	if (mode == BCH_RENAME_OVERWRITE) {
 		if (S_ISDIR(src_inode_u->bi_mode) !=
 		    S_ISDIR(dst_inode_u->bi_mode)) {
 			ret = -ENOTDIR;
@@ -477,8 +502,9 @@ int bch2_rename_trans(struct btree_trans *trans,
 		src_dir_u->bi_nlink += mode == BCH_RENAME_EXCHANGE;
 	}
 
-	if (mode == BCH_RENAME_OVERWRITE)
+	if (mode == BCH_RENAME_OVERWRITE || mode == BCH_RENAME_OVERWRITE_WHITEOUT) {
 		bch2_inode_nlink_dec(trans, dst_inode_u);
+	}
 
 	src_dir_u->bi_mtime		= now;
 	src_dir_u->bi_ctime		= now;
@@ -500,9 +526,14 @@ int bch2_rename_trans(struct btree_trans *trans,
 		bch2_inode_write(trans, &src_inode_iter, src_inode_u) ?:
 		(dst_inum.inum
 		 ? bch2_inode_write(trans, &dst_inode_iter, dst_inode_u)
+		 : 0) ?:
+		((mode == BCH_RENAME_WHITEOUT || mode == BCH_RENAME_OVERWRITE_WHITEOUT)
+		 ? bch2_inode_write(trans, &whiteout_inode_iter, &whiteout->inode_u)
 		 : 0);
 err:
 	bch2_trans_iter_exit(trans, &dst_inode_iter);
+	if (mode == BCH_RENAME_WHITEOUT || mode == BCH_RENAME_OVERWRITE_WHITEOUT)
+		bch2_trans_iter_exit(trans, &whiteout_inode_iter);
 	bch2_trans_iter_exit(trans, &src_inode_iter);
 	bch2_trans_iter_exit(trans, &dst_dir_iter);
 	bch2_trans_iter_exit(trans, &src_dir_iter);
